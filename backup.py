@@ -19,14 +19,46 @@ class SimpleSwitch13(app_manager.RyuApp):
         self.port_stats = {}
         self.threshold = 2000000 # soglia di throughput (bit/secondo)
 
-        self.thread = threading.Thread(target=self._monitor)
+        self.thread = threading.Thread(target=self._monitor, args=(self.datapaths,))
         self.thread.start()
     # funzione per il monitoraggio
-    def _monitor(self):
+    def _monitor(self, datap):
         self.logger.info("Monitor thread started")
         while True:
-            # MONITOR TRAFFIC ON SWITCHES
+            for dp in datap.values():
+                self._request_stats(dp)
             time.sleep(10)
+
+    def _port_stats_reply_handler(self, ev):
+        body = ev.msg.body
+
+        for stat in sorted(body, key=lambda x: x.port_no):
+            port_no = stat.port_no
+            rx_bytes = stat.rx_bytes
+            tx_bytes = stat.tx_bytes
+
+            if port_no in self.prev_stats:
+                prev_stats = self.prev_stats[port_no]
+                rx_throughput = (rx_bytes - prev_stats['rx_bytes']) / self.monitoring_interval
+                tx_throughput = (tx_bytes - prev_stats['tx_bytes']) / self.monitoring_interval
+            else:
+                rx_throughput = 0
+                tx_throughput = 0
+
+            self.logger.info('Port %d: RX %d bytes, TX %d bytes', port_no, rx_bytes, tx_bytes)
+            self.logger.info('Port %d: RX throughput %d bytes/s, TX throughput %d bytes/s', port_no, rx_throughput, tx_throughput)
+
+            self.prev_stats[port_no] = {'rx_bytes': rx_bytes, 'tx_bytes': tx_bytes}
+    # Questa funzione serve per richiedere le statistiche ad ogni switch attivo.
+    def _request_stats(self, datapath): 
+        self.logger.debug('Richiesta statistiche per lo switch: %016x', datapath.id)
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        # Creazione della richiesta di statistiche per le porte dello switch
+        req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
+        # Invio della richiesta allo switch
+        datapath.send_msg(req)
 
     # Gestore per i cambiamenti di stato degli switch
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, CONFIG_DISPATCHER])

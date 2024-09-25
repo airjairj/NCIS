@@ -8,6 +8,8 @@ from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
 import threading
 import time
+import csv
+import os
 
 class SimpleSwitch13(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -19,102 +21,81 @@ class SimpleSwitch13(app_manager.RyuApp):
         self.port_stats = {}
         self.threshold = 2000000 # soglia di throughput (bit/secondo)
 
-        self.thread = threading.Thread(target=self._monitor, args=(self.datapaths,))
+        self.thread = threading.Thread(target=self._monitor)
+        self.thread.daemon = True
         self.thread.start()
-    # funzione per il monitoraggio
-    def _monitor(self, datap):
+
+    def _monitor(self):
         self.logger.info("Monitor thread started")
+        if os.path.exists('port_stats.csv'):
+            os.remove('port_stats.csv')
         while True:
-            for dp in datap.values():
+            for dp in self.datapaths.values():
                 self._request_stats(dp)
+            self._stats_csv() #?
             time.sleep(10)
 
-    def _port_stats_reply_handler(self, ev):
-        body = ev.msg.body
-
-        for stat in sorted(body, key=lambda x: x.port_no):
-            port_no = stat.port_no
-            rx_bytes = stat.rx_bytes
-            tx_bytes = stat.tx_bytes
-
-            if port_no in self.prev_stats:
-                prev_stats = self.prev_stats[port_no]
-                rx_throughput = (rx_bytes - prev_stats['rx_bytes']) / self.monitoring_interval
-                tx_throughput = (tx_bytes - prev_stats['tx_bytes']) / self.monitoring_interval
-            else:
-                rx_throughput = 0
-                tx_throughput = 0
-
-            self.logger.info('Port %d: RX %d bytes, TX %d bytes', port_no, rx_bytes, tx_bytes)
-            self.logger.info('Port %d: RX throughput %d bytes/s, TX throughput %d bytes/s', port_no, rx_throughput, tx_throughput)
-
-            self.prev_stats[port_no] = {'rx_bytes': rx_bytes, 'tx_bytes': tx_bytes}
-    # Questa funzione serve per richiedere le statistiche ad ogni switch attivo.
-    def _request_stats(self, datapath): 
-        self.logger.debug('Richiesta statistiche per lo switch: %016x', datapath.id)
+    def _request_stats(self, datapath):
+        self.logger.debug('send stats request: %016x', datapath.id)
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # Creazione della richiesta di statistiche per le porte dello switch
         req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
-        # Invio della richiesta allo switch
         datapath.send_msg(req)
 
-    # Gestore per i cambiamenti di stato degli switch
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, CONFIG_DISPATCHER])
     def _state_change_handler(self, ev):
         datapath = ev.datapath
         if ev.state == MAIN_DISPATCHER:
-            # Registrazione dello switch se non è già presente
             if datapath.id not in self.datapaths:
                 self.logger.info('Register datapath: %016x', datapath.id)
                 self.datapaths[datapath.id] = datapath
         elif ev.state == 'DEAD_DISPATCHER':
-            # Rimozione dello switch se è stato disconnesso
             if datapath.id in self.datapaths:
                 self.logger.info('Unregister datapath: %016x', datapath.id)
                 del self.datapaths[datapath.id]
 
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def _port_stats_reply_handler(self, ev):
+        body = ev.msg.body
+        datapath = ev.msg.datapath
+        dpid = datapath.id
 
-    # *****
-    # Questa funzione serve a gestire le risposte ricevute dagli switch
-    @set_ev_cls(ofp_event.EventOFPPortStatsReply,MAIN_DISPATCHER) #decorator: serve ad associare la funzione all'evento EventOFPPortStatsReply, cioÃ¨ la ricezione delle statistiche da uno switch
-    def _port_stats_reply_handler(self,ev): #ev Ã¨ l'oggetto evento che contiene il messaggio di risposta. Questo parametro viene passato automaticamente dal framework ryu quando si verifica l'evento. ****Vedi Nota 1 su notion per la documentazione****.
+        self.port_stats.setdefault(dpid, {})
 
-        # Estrazione dei dati:
-        body= ev.msg.body 		# lista di statistiche per ogni porta dello switch
-        datapath= ev.msg.datapath	# lo switch da cui viene la risposta
-        dpid= datapath.id		# id dello switch (datapath) a cui si riferiscono le statistiche
-
-        self.port_stats.setdefault(dpid,{})	# se non esiste giÃ  una voce per dpid nel dizionario self.port_stats, viene creata una nuova voce associata a un dizionario vuoto. questo dizionario verrÃ  utilizzato per memorizzare le statistiche delle porte per quel particolare switch
-
-        # Elaborazione delle statistiche per ciascuna porta
         for stat in body:
-            port_no = stat.port_no # Ã¨ il numero della porta a cui si riferisce la statistica attuale
+            port_no = stat.port_no
 
-            # Verifica se le statistiche per la porta port_no sono giÃ  state memorizzate. Se no, vengono inizializzate.
+
+            # Skip special port numbers
+            if port_no >= ofproto_v1_3.OFPP_MAX:
+                continue
+
+
             if port_no not in self.port_stats[dpid]:
-                self.port_stats[dpid][port_no] ={  # Memorizziamo:
-                    'rx_bytes': stat.rx_bytes, # - numero di byte ricevuti
-                    'tx_bytes': stat.tx_bytes, # - numero di byte trasmessi
-                    'timestamp': time.time()   # - timestamp che indica il tempo attuale: servirÃ  per calcolare il throughput in future iterazioni
-                    }
+                self.port_stats[dpid][port_no] = {
+                    'rx_bytes': stat.rx_bytes,
+                    'tx_bytes': stat.tx_bytes,
+                    'timestamp': time.time()
+                }
             else:
-                prev_stats= self.port_stats[dpid][port_no] # statistiche precedentemente salvate per quella porta.
-                curr_time=time.time() #tempo attuale
-                time_diff=curr_time - prev_stats['timestamp'] #differenza tra tempo attuale e timestamp precedente
-                # Calcolo del throughput:
-                rx_throughput = (stat.rx - prev_stats['rx_bytes'])
-                tx_throughput = (stat.tx_bytes - prev_stats['tx_bytes'])
+                prev_stats = self.port_stats[dpid][port_no]
+                curr_time = time.time()
+                time_diff = curr_time - prev_stats['timestamp']
 
-                self.logger.info('Switch %s, Porta %s - RX Throughput_ %f bytes/sec, TX Throughput: %f bytes/sec', dpid, port_no, rx_throughput, tx_throughput)
-                # Verifica delle soglie (ancora dobbiamo scegliere la soglia)
-                if rx_throughput> self.threshold or tx_throughput>self.threshold:
-                    self.logger.warning('Allarme! Switch %s, Porta %s ha superato la soglia con throughput: RX=%f, TX=%f',dpid,port_no,rx_throughput,tx_throughput)
-                # Aggiornamento delle statistiche per la prossima iterazione:
-                self.port_stats[dpid][port_no]['rx_bytes']=stat.rx_bytes
-                self.port_stats[dpid][port_no]['tx_bytes']=stat.tx_bytes
-                self.port_stats[dpid][port_no]['timestamp']=curr_time
+                rx_throughput = (stat.rx_bytes - prev_stats['rx_bytes']) / time_diff
+                tx_throughput = (stat.tx_bytes - prev_stats['tx_bytes']) / time_diff
+
+                self.logger.info('Switch %s, Porta %s - RX Throughput: %f bytes/sec, TX Throughput: %f bytes/sec', dpid, port_no, rx_throughput, tx_throughput)
+
+                if rx_throughput > self.threshold or tx_throughput > self.threshold:
+                    self.logger.warning('Allarme! Switch %s, Porta %s ha superato la soglia con throughput: RX=%f, TX=%f', dpid, port_no, rx_throughput, tx_throughput)
+
+                self.port_stats[dpid][port_no]['rx_bytes'] = stat.rx_bytes
+                self.port_stats[dpid][port_no]['tx_bytes'] = stat.tx_bytes
+                self.port_stats[dpid][port_no]['timestamp'] = curr_time
+                self.port_stats[dpid][port_no]['rx_throughput'] = rx_throughput
+                self.port_stats[dpid][port_no]['tx_throughput'] = tx_throughput
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -122,16 +103,9 @@ class SimpleSwitch13(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # install table-miss flow entry
-        #
-        # We specify NO BUFFER to max_len of the output action due to
-        # OVS bug. At this moment, if we specify a lesser number, e.g.,
-        # 128, OVS will send Packet-In with invalid buffer_id and
-        # truncated packet data. In that case, we cannot output packets
-        # correctly.  The bug has been fixed in OVS v2.1.0.
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                        ofproto.OFPCML_NO_BUFFER)]
+                                          ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
@@ -139,7 +113,7 @@ class SimpleSwitch13(app_manager.RyuApp):
         parser = datapath.ofproto_parser
 
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
-                                            actions)]
+                                             actions)]
         if buffer_id:
             mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
                                     priority=priority, match=match,
@@ -151,11 +125,9 @@ class SimpleSwitch13(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        # If you hit this you might want to increase
-        # the "miss_send_length" of your switch
         if ev.msg.msg_len < ev.msg.total_len:
             self.logger.debug("packet truncated: only %s of %s bytes",
-                            ev.msg.msg_len, ev.msg.total_len)
+                              ev.msg.msg_len, ev.msg.total_len)
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -166,7 +138,6 @@ class SimpleSwitch13(app_manager.RyuApp):
         eth = pkt.get_protocols(ethernet.ethernet)[0]
 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-            # ignore lldp packet
             return
         dst = eth.dst
         src = eth.src
@@ -176,7 +147,6 @@ class SimpleSwitch13(app_manager.RyuApp):
 
         self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
 
-        # learn a mac address to avoid FLOOD next time.
         self.mac_to_port[dpid][src] = in_port
 
         if dst in self.mac_to_port[dpid]:
@@ -186,11 +156,8 @@ class SimpleSwitch13(app_manager.RyuApp):
 
         actions = [parser.OFPActionOutput(out_port)]
 
-        # install a flow to avoid packet_in next time
         if out_port != ofproto.OFPP_FLOOD:
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-            # verify if we have a valid buffer_id, if yes avoid to send both
-            # flow_mod & packet_out
             if msg.buffer_id != ofproto.OFP_NO_BUFFER:
                 self.add_flow(datapath, 1, match, actions, msg.buffer_id)
                 return
@@ -201,5 +168,27 @@ class SimpleSwitch13(app_manager.RyuApp):
             data = msg.data
 
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                in_port=in_port, actions=actions, data=data)
+                                  in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
+
+    def _stats_csv(self):
+        file_exists = os.path.isfile('port_stats.csv')
+        with open('port_stats.csv', mode='a') as csv_file:
+            fieldnames = ['timestamp', 'dpid', 'port_no', 'rx_bytes', 'tx_bytes', 'rx_throughput', 'tx_throughput']
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+
+            if not file_exists:
+                writer.writeheader()
+
+            for dpid, ports in self.port_stats.items():
+                for port_no, stats in ports.items():
+                    human_readable_timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stats['timestamp']))
+                    writer.writerow({
+                        'timestamp': human_readable_timestamp,
+                        'dpid': dpid,
+                        'port_no': port_no,
+                        'rx_bytes': stats['rx_bytes'],
+                        'tx_bytes': stats['tx_bytes'],
+                        'rx_throughput': stats.get('rx_throughput', 0),
+                        'tx_throughput': stats.get('tx_throughput', 0)
+                    })

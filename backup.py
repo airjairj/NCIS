@@ -19,11 +19,17 @@ class SimpleSwitch13(app_manager.RyuApp):
 
         self.datapaths = {}
         self.port_stats = {}
-        self.threshold = 2000000 # soglia di throughput (bit/secondo)
+        self.threshold = 300000 # soglia di throughput (bit/secondo)
+        self.watchlist = {}
 
-        self.thread = threading.Thread(target=self._monitor)
-        self.thread.daemon = True
-        self.thread.start()
+        self.thread_monitorning = threading.Thread(target=self._monitor)
+        self.thread_monitorning.daemon = True
+        self.thread_monitorning.start()
+
+        self.thread_mitigation = threading.Thread(target=self._limit_rate)
+        self.thread_mitigation.daemon = True
+        self.thread_mitigation.start()
+
 
     def _monitor(self):
         self.logger.info("Monitor thread started")
@@ -33,7 +39,62 @@ class SimpleSwitch13(app_manager.RyuApp):
             for dp in self.datapaths.values():
                 self._request_stats(dp)
             self._stats_csv() #?
-            time.sleep(10)
+            time.sleep(2)
+
+    def _limit_rate(self):
+        self.logger.info("Mitigating thread started")
+        while True:
+            watchlist_copy = self.watchlist.copy()  # copia perche cambia a runtime
+            for dpid, ports in watchlist_copy.items():
+                for port_no in ports:
+                    if dpid in self.port_stats and port_no in self.port_stats[dpid]:
+                        stats = self.port_stats[dpid][port_no]
+                        rx_throughput = stats.get('rx_throughput', 0)
+                        tx_throughput = stats.get('tx_throughput', 0)
+
+                        # Count the number of active ports
+                        active_ports = [p for p in self.port_stats[dpid] if p != port_no]
+                        num_active_ports = len(active_ports)
+                        self.logger.info("dpid, active_ports, num_active_ports :%s, %s, %s",dpid , active_ports, num_active_ports)
+
+
+                        # Calculate the final threshold based on the number of active ports
+                        if num_active_ports > 1:
+                            Final_threshold = (self.threshold + self.threshold * 0.1) / num_active_ports
+                        else:
+                            Final_threshold = 10000000
+
+                        if rx_throughput > Final_threshold:
+                            self.logger.warning('Mitigation starting: Switch %s, Port %s, rx Throughput=%f', dpid, port_no, rx_throughput)
+                            
+                            # Implement mitigation logic here
+                            if dpid == 3:
+                                datapath = self.datapaths[dpid]
+                                parser = datapath.ofproto_parser
+                                ofproto = datapath.ofproto
+
+                                # Create a match for incoming traffic on the port
+                                match = parser.OFPMatch(in_port=port_no)
+
+                                # Create an action to drop packets
+                                actions = []
+
+                                # Create a flow mod message to add the drop rule
+                                inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+
+                                self.add_flow(datapath, 3, match, actions)
+
+                                out = parser.OFPPacketOut(datapath=datapath, buffer_id=0, in_port=port_no, actions=actions, data=None)
+                                datapath.send_msg(out)
+
+                                self.logger.warning('MANDATO MESSAGGIO DI MITIGAZIONE: Switch %s, Port %s, rx Throughput=%f', dpid, port_no, rx_throughput)
+                        else:
+                            self.logger.info('Switch %s, Port %s is back to normal throughput: %f', dpid, port_no, rx_throughput)
+                            self.watchlist[dpid].remove(port_no)
+                            if not self.watchlist[dpid]:
+                                del self.watchlist[dpid]
+
+            time.sleep(2)
 
     def _request_stats(self, datapath):
         self.logger.debug('send stats request: %016x', datapath.id)
@@ -88,8 +149,13 @@ class SimpleSwitch13(app_manager.RyuApp):
 
                 self.logger.info('Switch %s, Porta %s - RX Throughput: %f bytes/sec, TX Throughput: %f bytes/sec', dpid, port_no, rx_throughput, tx_throughput)
 
-                if rx_throughput > self.threshold or tx_throughput > self.threshold:
-                    self.logger.warning('Allarme! Switch %s, Porta %s ha superato la soglia con throughput: RX=%f, TX=%f', dpid, port_no, rx_throughput, tx_throughput)
+                if rx_throughput > self.threshold:
+                    self.logger.warning('Allarme! Switch %s, Porta %s ha superato la soglia con throughput: RX=%f', dpid, port_no, rx_throughput)
+                    if dpid not in self.watchlist:
+                        self.watchlist[dpid] = []
+                    if port_no not in self.watchlist[dpid]:
+                        self.watchlist[dpid].append(port_no)
+                    
 
                 self.port_stats[dpid][port_no]['rx_bytes'] = stat.rx_bytes
                 self.port_stats[dpid][port_no]['tx_bytes'] = stat.tx_bytes
@@ -145,7 +211,7 @@ class SimpleSwitch13(app_manager.RyuApp):
         dpid = datapath.id
         self.mac_to_port.setdefault(dpid, {})
 
-        self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
+        #self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
 
         self.mac_to_port[dpid][src] = in_port
 

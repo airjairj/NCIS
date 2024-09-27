@@ -42,7 +42,9 @@ class SimpleSwitch13(app_manager.RyuApp):
             time.sleep(2)
 
     def _limit_rate(self):
+        lower_threshold = 0.1 * self.threshold
         self.logger.info("Mitigating thread started")
+        blocked_ports = []
         while True:
             watchlist_copy = self.watchlist.copy()  # copia perche cambia a runtime
             for dpid, ports in watchlist_copy.items():
@@ -52,11 +54,11 @@ class SimpleSwitch13(app_manager.RyuApp):
                         rx_throughput = stats.get('rx_throughput', 0)
                         tx_throughput = stats.get('tx_throughput', 0)
 
-                        # Count the number of active ports
-                        active_ports = [p for p in self.port_stats[dpid] if p != port_no]
-                        num_active_ports = len(active_ports)
-                        self.logger.info("dpid, active_ports, num_active_ports :%s, %s, %s",dpid , active_ports, num_active_ports)
+                        # Count the number of input active ports with non-zero throughput
+                        active_ports = [p for p in self.port_stats[dpid] if self.port_stats[dpid][p].get('rx_throughput', 0) > lower_threshold]
+                        num_active_ports = len(active_ports) - len(blocked_ports)
 
+                        self.logger.info("dpid, active_ports, num_active_ports :%s, %s, %s", dpid, active_ports, num_active_ports)
 
                         # Calculate the final threshold based on the number of active ports
                         if num_active_ports > 1:
@@ -79,15 +81,14 @@ class SimpleSwitch13(app_manager.RyuApp):
                                 # Create an action to drop packets
                                 actions = []
 
-                                # Create a flow mod message to add the drop rule
-                                inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-
                                 self.add_flow(datapath, 3, match, actions)
 
                                 out = parser.OFPPacketOut(datapath=datapath, buffer_id=0, in_port=port_no, actions=actions, data=None)
                                 datapath.send_msg(out)
 
                                 self.logger.warning('MANDATO MESSAGGIO DI MITIGAZIONE: Switch %s, Port %s, rx Throughput=%f', dpid, port_no, rx_throughput)
+                                if port_no not in blocked_ports:
+                                    blocked_ports.append(port_no)
                         else:
                             self.logger.info('Switch %s, Port %s is back to normal throughput: %f', dpid, port_no, rx_throughput)
                             self.watchlist[dpid].remove(port_no)

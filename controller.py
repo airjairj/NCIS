@@ -97,8 +97,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             for port_key in list(blocked_ports.keys()):
                 blocked_ports[port_key] += 1
                 if blocked_ports[port_key] >= 3:
-                    self.logger.info('Unblocking port: %s', port_key)
-                    del blocked_ports[port_key]
+                    self.logger.info('\n\n\nSBLOCCO port: %s\n\n\n', port_key)
 
                     # Implement unblocking logic here
                     dpid, port_no = map(int, port_key.split(','))
@@ -112,9 +111,20 @@ class SimpleSwitch13(app_manager.RyuApp):
                     actions = [parser.OFPActionOutput(port_no)]
 
                     # Remove the drop flow entry
-                    self.add_flow(datapath, 1, match, actions)
+                    mod = parser.OFPFlowMod(
+                        datapath=datapath,
+                        command=datapath.ofproto.OFPFC_DELETE,
+                        out_port=port_no,
+                        out_group=datapath.ofproto.OFPG_ANY,
+                        match=match
+                    )
+                    datapath.send_msg(mod)
+
+                    # Add the new flow entry to forward packets normally
+                    self.add_flow(datapath, 2, match, actions)
 
                     self.logger.info('Unblocked port: Switch %s, Port %s', dpid, port_no)
+                    del blocked_ports[port_key]
 
             time.sleep(5)
 

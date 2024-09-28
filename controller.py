@@ -42,91 +42,74 @@ class SimpleSwitch13(app_manager.RyuApp):
             time.sleep(5)
 
     def _limit_rate(self):
+        self.logger.info("Mitigation thread started")
         lower_threshold = 0.1 * self.threshold
-        self.logger.info("Mitigating thread started")
-        blocked_ports = {}
+
         while True:
-            watchlist_copy = self.watchlist.copy()  # copia perche cambia a runtime
+            watchlist_copy = self.watchlist.copy()  # Copy to avoid runtime changes
             for dpid, ports in watchlist_copy.items():
                 for port_no in ports:
                     if dpid in self.port_stats and port_no in self.port_stats[dpid]:
                         stats = self.port_stats[dpid][port_no]
                         rx_throughput = stats.get('rx_throughput', 0)
-                        tx_throughput = stats.get('tx_throughput', 0)
-
-                        # Count the number of input active ports with non-zero throughput
-                        active_ports = [p for p in self.port_stats[dpid] if self.port_stats[dpid][p].get('rx_throughput', 0) > lower_threshold]
-                        num_active_ports = len(active_ports) - len(blocked_ports)
-                        #self.logger.info("dpid, active_ports, num_active_ports :%s, %s, %s", dpid, active_ports, num_active_ports)
 
                         # Calculate the final threshold based on the number of active ports
-                        if num_active_ports > 1:
-                            final_threshold = (self.threshold + self.threshold * 0.1) / num_active_ports
+                        active_ports = [p for p in self.port_stats[dpid] if self.port_stats[dpid][p].get('rx_throughput', 0) > lower_threshold]
+                        num_active_ports = len(active_ports)
+                        final_threshold = (self.threshold + self.threshold * 0.1) / num_active_ports if num_active_ports > 1 else 10000000
+
+                        if rx_throughput > final_threshold and dpid == 3 and dpid != 4: # MI SEMBRA VENGANO IGNORATI QUESTI DPID == 3 E != 4
+                            self._block_port(dpid, port_no)
                         else:
-                            final_threshold = 10000000
-
-                        port_key = f"{dpid},{port_no}"
-
-                        if rx_throughput > final_threshold:
-
-                            if dpid == 3:
-                                datapath = self.datapaths[dpid]
-                                parser = datapath.ofproto_parser
-
-                                # Create a match for incoming traffic on the port
-                                match = parser.OFPMatch(in_port=port_no)
-
-                                # Create an action to drop packets
-                                actions = []
-
-                                self.add_flow(datapath, 2, match, actions)
-
-                                out = parser.OFPPacketOut(datapath=datapath, buffer_id=0, in_port=port_no, actions=actions, data=None)
-                                datapath.send_msg(out)
-
-                                self.logger.warning('MANDATO MESSAGGIO DI MITIGAZIONE: Switch %s, Port %s, rx Throughput=%f', dpid, port_no, rx_throughput)
-                                if port_key not in blocked_ports:
-                                    blocked_ports[port_key] = 0
-                        else:
-                            self.logger.info('Switch %s, Port %s is back to normal throughput: %f', dpid, port_no, rx_throughput)
-                            self.watchlist[dpid].remove(port_no)
-                            if not self.watchlist[dpid]:
-                                del self.watchlist[dpid]
-
-            # Update blocked_ports dictionary
-            for port_key in list(blocked_ports.keys()):
-                blocked_ports[port_key] += 1
-                if blocked_ports[port_key] >= 3:
-                    self.logger.info('\n\n\nSBLOCCO port: %s\n\n\n', port_key)
-
-                    # Implement unblocking logic here
-                    dpid, port_no = map(int, port_key.split(','))
-                    datapath = self.datapaths[dpid]
-                    parser = datapath.ofproto_parser
-
-                    # Create a match for incoming traffic on the port
-                    match = parser.OFPMatch(in_port=port_no)
-
-                    # Create an action to forward packets normally
-                    actions = [parser.OFPActionOutput(port_no)]
-
-                    # Remove the drop flow entry
-                    mod = parser.OFPFlowMod(
-                        datapath=datapath,
-                        command=datapath.ofproto.OFPFC_DELETE,
-                        out_port=port_no,
-                        out_group=datapath.ofproto.OFPG_ANY,
-                        match=match
-                    )
-                    datapath.send_msg(mod)
-
-                    # Add the new flow entry to forward packets normally
-                    self.add_flow(datapath, 2, match, actions)
-
-                    self.logger.info('Unblocked port: Switch %s, Port %s', dpid, port_no)
-                    del blocked_ports[port_key]
+                            self._unblock_port(dpid, port_no)
 
             time.sleep(5)
+
+    def _block_port(self, dpid, port_no):
+        datapath = self.datapaths[dpid]
+        parser = datapath.ofproto_parser
+
+        # Create a match for incoming traffic on the port with Host1's MAC address
+        host1_mac = "00:00:00:00:00:01"  # Host1 MAC address
+        match = parser.OFPMatch(in_port=port_no, eth_src=host1_mac)
+
+        # Create an action to drop packets
+        actions = []
+
+        self.add_flow(datapath, 2, match, actions)
+
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=0, in_port=port_no, actions=actions, data=None)
+        datapath.send_msg(out)
+
+        self.logger.warning('Blocking traffic from Host1: Switch %s, Port %s, RX Throughput=%f', dpid, port_no, self.port_stats[dpid][port_no].get('rx_throughput', 0))
+
+    def _unblock_port(self, dpid, port_no):
+        if port_no in self.watchlist.get(dpid, []):
+            self.logger.info('Unblocking Host1: Switch %s, Port %s', dpid, port_no)
+            self.watchlist[dpid].remove(port_no)
+            if not self.watchlist[dpid]:
+                del self.watchlist[dpid]
+
+            # Remove the flow entry for Host1 that drops packets
+            datapath = self.datapaths[dpid]
+            parser = datapath.ofproto_parser
+            host1_mac = "00:00:00:00:00:01"  # Host1 MAC address
+            match = parser.OFPMatch(in_port=port_no, eth_src=host1_mac)
+            self.remove_flow(datapath, match)
+
+
+    def remove_flow(self, datapath, match):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_DELETE,
+            out_port=ofproto.OFPP_ANY,
+            out_group=ofproto.OFPG_ANY,
+            match=match
+        )
+        datapath.send_msg(mod)
 
     def _request_stats(self, datapath):
         self.logger.debug('send stats request: %016x', datapath.id)

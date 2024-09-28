@@ -39,63 +39,74 @@ class SimpleSwitch13(app_manager.RyuApp):
             for dp in self.datapaths.values():
                 self._request_stats(dp)
             self._stats_csv() #?
-            time.sleep(2)
+            time.sleep(5)
 
     def _limit_rate(self):
+        self.logger.info("Mitigation thread started")
         lower_threshold = 0.1 * self.threshold
-        self.logger.info("Mitigating thread started")
-        blocked_ports = []
+
         while True:
-            watchlist_copy = self.watchlist.copy()  # copia perche cambia a runtime
+            watchlist_copy = self.watchlist.copy()  # Copy to avoid runtime changes
             for dpid, ports in watchlist_copy.items():
                 for port_no in ports:
                     if dpid in self.port_stats and port_no in self.port_stats[dpid]:
                         stats = self.port_stats[dpid][port_no]
                         rx_throughput = stats.get('rx_throughput', 0)
-                        tx_throughput = stats.get('tx_throughput', 0)
-
-                        # Count the number of input active ports with non-zero throughput
-                        active_ports = [p for p in self.port_stats[dpid] if self.port_stats[dpid][p].get('rx_throughput', 0) > lower_threshold]
-                        num_active_ports = len(active_ports) - len(blocked_ports)
-
-                        self.logger.info("dpid, active_ports, num_active_ports :%s, %s, %s", dpid, active_ports, num_active_ports)
 
                         # Calculate the final threshold based on the number of active ports
-                        if num_active_ports > 1:
-                            Final_threshold = (self.threshold + self.threshold * 0.1) / num_active_ports
+                        active_ports = [p for p in self.port_stats[dpid] if self.port_stats[dpid][p].get('rx_throughput', 0) > lower_threshold]
+                        num_active_ports = len(active_ports)
+                        final_threshold = (self.threshold + self.threshold * 0.1) / num_active_ports if num_active_ports > 1 else 10000000
+
+                        if rx_throughput > final_threshold and dpid == 3:
+                            self._block_port(dpid, port_no)
                         else:
-                            Final_threshold = 10000000
+                            self._unblock_port(dpid, port_no)
 
-                        if rx_throughput > Final_threshold:
-                            self.logger.warning('Mitigation starting: Switch %s, Port %s, rx Throughput=%f', dpid, port_no, rx_throughput)
-                            
-                            # Implement mitigation logic here
-                            if dpid == 3:
-                                datapath = self.datapaths[dpid]
-                                parser = datapath.ofproto_parser
-                                ofproto = datapath.ofproto
+            time.sleep(5)
 
-                                # Create a match for incoming traffic on the port
-                                match = parser.OFPMatch(in_port=port_no)
+    def _block_port(self, dpid, port_no):
+        datapath = self.datapaths[dpid]
+        parser = datapath.ofproto_parser
 
-                                # Create an action to drop packets
-                                actions = []
+        # Create a match for incoming traffic on the port
+        match = parser.OFPMatch(in_port=port_no)
 
-                                self.add_flow(datapath, 3, match, actions)
+        # Create an action to drop packets
+        actions = []
 
-                                out = parser.OFPPacketOut(datapath=datapath, buffer_id=0, in_port=port_no, actions=actions, data=None)
-                                datapath.send_msg(out)
+        self.add_flow(datapath, 2, match, actions)
 
-                                self.logger.warning('MANDATO MESSAGGIO DI MITIGAZIONE: Switch %s, Port %s, rx Throughput=%f', dpid, port_no, rx_throughput)
-                                if port_no not in blocked_ports:
-                                    blocked_ports.append(port_no)
-                        else:
-                            self.logger.info('Switch %s, Port %s is back to normal throughput: %f', dpid, port_no, rx_throughput)
-                            self.watchlist[dpid].remove(port_no)
-                            if not self.watchlist[dpid]:
-                                del self.watchlist[dpid]
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=0, in_port=port_no, actions=actions, data=None)
+        datapath.send_msg(out)
 
-            time.sleep(2)
+        self.logger.warning('Blocking port: Switch %s, Port %s, RX Throughput=%f', dpid, port_no, self.port_stats[dpid][port_no].get('rx_throughput', 0))
+
+    def _unblock_port(self, dpid, port_no):
+        if port_no in self.watchlist.get(dpid, []):
+            self.logger.info('Unblocking port: Switch %s, Port %s', dpid, port_no)
+            self.watchlist[dpid].remove(port_no)
+            if not self.watchlist[dpid]:
+                del self.watchlist[dpid]
+
+            # Remove the flow entry that drops packets
+            datapath = self.datapaths[dpid]
+            parser = datapath.ofproto_parser
+            match = parser.OFPMatch(in_port=port_no)
+            self.remove_flow(datapath, match)
+
+    def remove_flow(self, datapath, match):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            command=ofproto.OFPFC_DELETE,
+            out_port=ofproto.OFPP_ANY,
+            out_group=ofproto.OFPG_ANY,
+            match=match
+        )
+        datapath.send_msg(mod)
 
     def _request_stats(self, datapath):
         self.logger.debug('send stats request: %016x', datapath.id)
@@ -151,7 +162,8 @@ class SimpleSwitch13(app_manager.RyuApp):
                 self.logger.info('Switch %s, Porta %s - RX Throughput: %f bytes/sec, TX Throughput: %f bytes/sec', dpid, port_no, rx_throughput, tx_throughput)
 
                 if rx_throughput > self.threshold:
-                    self.logger.warning('Allarme! Switch %s, Porta %s ha superato la soglia con throughput: RX=%f', dpid, port_no, rx_throughput)
+                    if dpid == 3:
+                        self.logger.warning('Allarme! Switch %s, Porta %s ha superato la soglia con throughput: RX=%f', dpid, port_no, rx_throughput)
                     if dpid not in self.watchlist:
                         self.watchlist[dpid] = []
                     if port_no not in self.watchlist[dpid]:

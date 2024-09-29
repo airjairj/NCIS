@@ -17,10 +17,15 @@ class SimpleSwitch13(app_manager.RyuApp):
         super(SimpleSwitch13, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
 
+        self.num_active_ports = 0
+        self.active_ports = []
+
         self.datapaths = {}
         self.port_stats = {}
         self.threshold = 300000 # soglia di throughput (bit/secondo)
         self.watchlist = {}
+        self.blocklist = {}
+        self.lower_threshold = 0.02 * self.threshold
 
         self.thread_monitorning = threading.Thread(target=self._monitor)
         self.thread_monitorning.daemon = True
@@ -29,7 +34,6 @@ class SimpleSwitch13(app_manager.RyuApp):
         self.thread_mitigation = threading.Thread(target=self._limit_rate)
         self.thread_mitigation.daemon = True
         self.thread_mitigation.start()
-
 
     def _monitor(self):
         self.logger.info("Monitor thread started")
@@ -43,35 +47,27 @@ class SimpleSwitch13(app_manager.RyuApp):
 
     def _limit_rate(self):
         self.logger.info("Mitigation thread started")
-        lower_threshold = 0.1 * self.threshold
 
         while True:
-            watchlist_copy = self.watchlist.copy()  # Copy to avoid runtime changes
-            for dpid, ports in watchlist_copy.items():
-                for port_no in ports:
-                    if dpid in self.port_stats and port_no in self.port_stats[dpid]:
-                        stats = self.port_stats[dpid][port_no]
-                        rx_throughput = stats.get('rx_throughput', 0)
 
-                        # Calculate the final threshold based on the number of active ports
-                        active_ports = [p for p in self.port_stats[dpid] if self.port_stats[dpid][p].get('rx_throughput', 0) > lower_threshold]
-                        num_active_ports = len(active_ports)
-                        final_threshold = (self.threshold + self.threshold * 0.1) / num_active_ports if num_active_ports > 1 else 10000000
+            for (dpid, port_no), count in list(self.blocklist.items()):
+                if count > 4:
+                    self._unblock_port(dpid, port_no)
+                    del self.blocklist[(dpid, port_no)]
+                else:
+                    self.blocklist[(dpid, port_no)] += 1
 
-                        if rx_throughput > final_threshold and dpid == 3 and dpid != 4: # MI SEMBRA VENGANO IGNORATI QUESTI DPID == 3 E != 4
-                            self._block_port(dpid, port_no)
-                        else:
-                            self._unblock_port(dpid, port_no)
-
+            self.logger.info(f"Blocklist: {self.blocklist}")
             time.sleep(5)
 
     def _block_port(self, dpid, port_no):
+        del self.watchlist[(dpid, port_no)]
+        self.logger.info(f'\nRIMUOVO Watchlist: {self.watchlist}\n')
         datapath = self.datapaths[dpid]
         parser = datapath.ofproto_parser
 
-        # Create a match for incoming traffic on the port with Host1's MAC address
-        host1_mac = "00:00:00:00:00:01"  # Host1 MAC address
-        match = parser.OFPMatch(in_port=port_no, eth_src=host1_mac)
+        # Create a match for incoming traffic on the port
+        match = parser.OFPMatch(in_port=port_no)
 
         # Create an action to drop packets
         actions = []
@@ -81,22 +77,16 @@ class SimpleSwitch13(app_manager.RyuApp):
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=0, in_port=port_no, actions=actions, data=None)
         datapath.send_msg(out)
 
-        self.logger.warning('Blocking traffic from Host1: Switch %s, Port %s, RX Throughput=%f', dpid, port_no, self.port_stats[dpid][port_no].get('rx_throughput', 0))
+        self.logger.info('Blocking port: Switch %s, Port %s, RX Throughput=%f', dpid, port_no, self.port_stats[dpid][port_no].get('rx_throughput', 0))
 
     def _unblock_port(self, dpid, port_no):
-        if port_no in self.watchlist.get(dpid, []):
-            self.logger.info('Unblocking Host1: Switch %s, Port %s', dpid, port_no)
-            self.watchlist[dpid].remove(port_no)
-            if not self.watchlist[dpid]:
-                del self.watchlist[dpid]
+        self.logger.info('Unblocking port: Switch %s, Port %s', dpid, port_no)
 
-            # Remove the flow entry for Host1 that drops packets
-            datapath = self.datapaths[dpid]
-            parser = datapath.ofproto_parser
-            host1_mac = "00:00:00:00:00:01"  # Host1 MAC address
-            match = parser.OFPMatch(in_port=port_no, eth_src=host1_mac)
-            self.remove_flow(datapath, match)
-
+        # Remove the flow entry that drops packets
+        datapath = self.datapaths[dpid]
+        parser = datapath.ofproto_parser
+        match = parser.OFPMatch(in_port=port_no)
+        self.remove_flow(datapath, match)
 
     def remove_flow(self, datapath, match):
         ofproto = datapath.ofproto
@@ -162,16 +152,35 @@ class SimpleSwitch13(app_manager.RyuApp):
                 rx_throughput = (stat.rx_bytes - prev_stats['rx_bytes']) / time_diff
                 tx_throughput = (stat.tx_bytes - prev_stats['tx_bytes']) / time_diff
 
-                self.logger.info('Switch %s, Porta %s - RX Throughput: %f bytes/sec, TX Throughput: %f bytes/sec', dpid, port_no, rx_throughput, tx_throughput)
+                #self.logger.info('Switch %s, Porta %s - RX Throughput: %f bytes/sec, TX Throughput: %f bytes/sec', dpid, port_no, rx_throughput, tx_throughput)
 
-                if rx_throughput > self.threshold:
-                    if dpid == 3:
+                self.active_ports = [p for p in self.port_stats[dpid] if (self.port_stats[dpid][p].get('rx_throughput', 0)+self.port_stats[dpid][p].get('tx_throughput', 0)) > self.lower_threshold]
+                self.num_active_ports = len(self.active_ports) - 1 - len(self.blocklist)
+
+                if dpid == 3:
+                    if rx_throughput > self.threshold and self.num_active_ports > 1:
                         self.logger.warning('Allarme! Switch %s, Porta %s ha superato la soglia con throughput: RX=%f', dpid, port_no, rx_throughput)
-                    if dpid not in self.watchlist:
-                        self.watchlist[dpid] = []
-                    if port_no not in self.watchlist[dpid]:
-                        self.watchlist[dpid].append(port_no)
-                    
+                        if (dpid, port_no) not in self.watchlist and (dpid, port_no) not in self.blocklist:
+                            self.watchlist[(dpid, port_no)] = 0
+                        elif (dpid, port_no) in self.watchlist:
+                            self.watchlist[(dpid, port_no)] += 1
+
+                        self.logger.info(f'\n AGGIUNGO Watchlist: {self.watchlist}\n')
+                    elif rx_throughput < self.threshold:
+                        if (dpid, port_no) in self.watchlist:
+                            if self.watchlist[(dpid, port_no)] > 0:
+                                self.watchlist[(dpid, port_no)] -= 1
+
+                # Calculate the final threshold based on the number of active ports
+                final_threshold = (self.threshold + self.threshold * 0.1) / self.num_active_ports if self.num_active_ports > 1 else 10000000
+
+                if (dpid, port_no) in self.watchlist:
+                    if rx_throughput > final_threshold and self.watchlist[(dpid, port_no)] > 2:
+                        if (dpid, port_no) not in self.blocklist:
+                            self.blocklist[(dpid, port_no)] = 0
+
+                        self._block_port(dpid, port_no)
+
 
                 self.port_stats[dpid][port_no]['rx_bytes'] = stat.rx_bytes
                 self.port_stats[dpid][port_no]['tx_bytes'] = stat.tx_bytes
@@ -256,7 +265,7 @@ class SimpleSwitch13(app_manager.RyuApp):
     def _stats_csv(self):
         file_exists = os.path.isfile('port_stats.csv')
         with open('port_stats.csv', mode='a') as csv_file:
-            fieldnames = ['timestamp', 'dpid', 'port_no', 'rx_bytes', 'tx_bytes', 'rx_throughput', 'tx_throughput']
+            fieldnames = ['timestamp', 'dpid', 'port_no', 'rx_bytes', 'tx_bytes', 'rx_throughput', 'tx_throughput', 'num_active_ports', 'active_ports', 'blocklist']
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
 
             if not file_exists:
@@ -272,5 +281,8 @@ class SimpleSwitch13(app_manager.RyuApp):
                         'rx_bytes': stats['rx_bytes'],
                         'tx_bytes': stats['tx_bytes'],
                         'rx_throughput': stats.get('rx_throughput', 0),
-                        'tx_throughput': stats.get('tx_throughput', 0)
+                        'tx_throughput': stats.get('tx_throughput', 0),
+                        'num_active_ports': self.num_active_ports,
+                        'active_ports': self.active_ports,
+                        'blocklist': self.blocklist
                     })

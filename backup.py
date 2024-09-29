@@ -21,6 +21,7 @@ class SimpleSwitch13(app_manager.RyuApp):
         self.port_stats = {}
         self.threshold = 300000 # soglia di throughput (bit/secondo)
         self.watchlist = {}
+        self.blocklist = {}
 
         self.thread_monitorning = threading.Thread(target=self._monitor)
         self.thread_monitorning.daemon = True
@@ -29,7 +30,6 @@ class SimpleSwitch13(app_manager.RyuApp):
         self.thread_mitigation = threading.Thread(target=self._limit_rate)
         self.thread_mitigation.daemon = True
         self.thread_mitigation.start()
-
 
     def _monitor(self):
         self.logger.info("Monitor thread started")
@@ -46,8 +46,8 @@ class SimpleSwitch13(app_manager.RyuApp):
         lower_threshold = 0.1 * self.threshold
 
         while True:
-            watchlist_copy = self.watchlist.copy()  # Copy to avoid runtime changes
-            for dpid, ports in watchlist_copy.items():
+            self.watchlist_copy = self.watchlist.copy()  # Copy to avoid runtime changes
+            for dpid, ports in self.watchlist_copy.items():
                 for port_no in ports:
                     if dpid in self.port_stats and port_no in self.port_stats[dpid]:
                         stats = self.port_stats[dpid][port_no]
@@ -58,11 +58,22 @@ class SimpleSwitch13(app_manager.RyuApp):
                         num_active_ports = len(active_ports)
                         final_threshold = (self.threshold + self.threshold * 0.1) / num_active_ports if num_active_ports > 1 else 10000000
 
-                        if rx_throughput > final_threshold and dpid == 3:
-                            self._block_port(dpid, port_no)
-                        else:
-                            self._unblock_port(dpid, port_no)
+                        self.logger.info(f"\nNUMERO DI PORTE ATTIVE: {num_active_ports}")
+                        self.logger.info(f"active_ports: {active_ports}\n")
 
+                        if rx_throughput > final_threshold:
+                            self._block_port(dpid, port_no)
+                            if dpid not in self.blocklist:
+                                self.blocklist[(dpid,port_no)] = 0
+
+            for (dpid, port_no), count in list(self.blocklist.items()):
+                if count >= 3:
+                    self._unblock_port(dpid, port_no)
+                    del self.blocklist[(dpid, port_no)]
+                else:
+                    self.blocklist[(dpid, port_no)] += 1
+
+            self.logger.info(f"Blocklist: {self.blocklist}")
             time.sleep(5)
 
     def _block_port(self, dpid, port_no):
@@ -80,20 +91,16 @@ class SimpleSwitch13(app_manager.RyuApp):
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=0, in_port=port_no, actions=actions, data=None)
         datapath.send_msg(out)
 
-        self.logger.warning('Blocking port: Switch %s, Port %s, RX Throughput=%f', dpid, port_no, self.port_stats[dpid][port_no].get('rx_throughput', 0))
+        self.logger.info('Blocking port: Switch %s, Port %s, RX Throughput=%f', dpid, port_no, self.port_stats[dpid][port_no].get('rx_throughput', 0))
 
     def _unblock_port(self, dpid, port_no):
-        if port_no in self.watchlist.get(dpid, []):
-            self.logger.info('Unblocking port: Switch %s, Port %s', dpid, port_no)
-            self.watchlist[dpid].remove(port_no)
-            if not self.watchlist[dpid]:
-                del self.watchlist[dpid]
+        self.logger.info('Unblocking port: Switch %s, Port %s', dpid, port_no)
 
-            # Remove the flow entry that drops packets
-            datapath = self.datapaths[dpid]
-            parser = datapath.ofproto_parser
-            match = parser.OFPMatch(in_port=port_no)
-            self.remove_flow(datapath, match)
+        # Remove the flow entry that drops packets
+        datapath = self.datapaths[dpid]
+        parser = datapath.ofproto_parser
+        match = parser.OFPMatch(in_port=port_no)
+        self.remove_flow(datapath, match)
 
     def remove_flow(self, datapath, match):
         ofproto = datapath.ofproto

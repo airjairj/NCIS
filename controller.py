@@ -43,7 +43,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             for dp in self.datapaths.values():
                 self._request_stats(dp)
             self._stats_csv() #?
-            time.sleep(5)
+            time.sleep(2)
 
     def _limit_rate(self):
         self.logger.info("Mitigation thread started")
@@ -175,7 +175,7 @@ class SimpleSwitch13(app_manager.RyuApp):
                 final_threshold = (self.threshold + self.threshold * 0.1) / self.num_active_ports if self.num_active_ports > 1 else 10000000
 
                 if (dpid, port_no) in self.watchlist:
-                    if rx_throughput > final_threshold and self.watchlist[(dpid, port_no)] > 2:
+                    if rx_throughput > final_threshold and self.watchlist[(dpid, port_no)] > 1:
                         if (dpid, port_no) not in self.blocklist:
                             self.blocklist[(dpid, port_no)] = 0
 

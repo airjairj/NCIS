@@ -21,6 +21,10 @@ class Environment(object):
         self.h1 = self.net.addHost('h1', mac ='00:00:00:00:00:01', ip= '10.0.0.1') #indirizzo MAC e Ip sono opzionali 
         self.h2 = self.net.addHost('h2', mac ='00:00:00:00:00:02', ip= '10.0.0.2')
         self.h3 = self.net.addHost('h3', mac ='00:00:00:00:00:03', ip= '10.0.0.3')
+
+        # OPZIONALE
+        self.h4 = self.net.addHost('h4', mac ='00:00:00:00:00:04', ip= '10.0.0.4')
+        
         self.cpe1 = self.net.addSwitch('s1', cls=OVSKernelSwitch) #gli switch devono essere di tipo openflow
         self.cpe2 = self.net.addSwitch('s2', cls=OVSKernelSwitch)
         self.cpe3 = self.net.addSwitch('s3', cls=OVSKernelSwitch)
@@ -32,7 +36,11 @@ class Environment(object):
         self.net.addLink(self.cpe2, self.cpe3, bw=3, delay='25ms')
         self.net.addLink(self.cpe3, self.cpe4, bw=3, delay='25ms')
         self.net.addLink(self.cpe4, self.h3, bw=6, delay='0.0025ms')
-        
+
+        # OPZIONALE
+        self.net.addLink(self.h4, self.cpe1, bw=6, delay='0.0025ms')
+
+
         info("*** Starting network\n")
         self.net.build()
         self.net.start()
@@ -44,6 +52,8 @@ class Environment(object):
         #	s3 collegato ad s4
         #	h3 collegato ad s4
         
+        # OPZIONALE
+        #   h4 collegato a s1
 
 ...
 if __name__ == '__main__':

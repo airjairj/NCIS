@@ -154,33 +154,7 @@ class SimpleSwitch13(app_manager.RyuApp):
 
                 #self.logger.info('Switch %s, Porta %s - RX Throughput: %f bytes/sec, TX Throughput: %f bytes/sec', dpid, port_no, rx_throughput, tx_throughput)
 
-                self.active_ports = [p for p in self.port_stats[dpid] if (self.port_stats[dpid][p].get('rx_throughput', 0)+self.port_stats[dpid][p].get('tx_throughput', 0)) > self.lower_threshold]
-                self.num_active_ports = len(self.active_ports) - 1 - len(self.blocklist)
-
-                if self.num_active_ports > 1:
-                    if rx_throughput > self.threshold:
-                        self.logger.warning('Allarme! Switch %s, Porta %s ha superato la soglia con throughput: RX=%f', dpid, port_no, rx_throughput)
-                        if (dpid, port_no) not in self.watchlist and (dpid, port_no) not in self.blocklist:
-                            self.watchlist[(dpid, port_no)] = 0
-                        elif (dpid, port_no) in self.watchlist:
-                            self.watchlist[(dpid, port_no)] += 1
-
-                        self.logger.info(f'\nAGGIUNGO Watchlist: {self.watchlist}\n')
-                    elif rx_throughput < self.threshold:
-                        if (dpid, port_no) in self.watchlist:
-                            if self.watchlist[(dpid, port_no)] > 0:
-                                self.watchlist[(dpid, port_no)] -= 1
-
-                # Calculate the final threshold based on the number of active ports
-                final_threshold = (self.threshold + self.threshold * 0.1) / self.num_active_ports if self.num_active_ports > 1 else 10000000
-
-                if (dpid, port_no) in self.watchlist:
-                    if rx_throughput > final_threshold and self.watchlist[(dpid, port_no)] > 1:
-                        if (dpid, port_no) not in self.blocklist:
-                            self.blocklist[(dpid, port_no)] = 0
-
-                        self._block_port(dpid, port_no)
-
+                self._mitigation_logic(rx_throughput, dpid, port_no)
 
                 self.port_stats[dpid][port_no]['rx_bytes'] = stat.rx_bytes
                 self.port_stats[dpid][port_no]['tx_bytes'] = stat.tx_bytes
@@ -286,3 +260,32 @@ class SimpleSwitch13(app_manager.RyuApp):
                         'active_ports': self.active_ports,
                         'blocklist': self.blocklist
                     })
+
+    def _mitigation_logic(self, rx_throughput, dpid, port_no):
+
+        self.active_ports = [p for p in self.port_stats[dpid] if (self.port_stats[dpid][p].get('rx_throughput', 0)+self.port_stats[dpid][p].get('tx_throughput', 0)) > self.lower_threshold]
+        self.num_active_ports = len(self.active_ports) - 1 - len(self.blocklist)
+
+        if self.num_active_ports > 1:
+            if rx_throughput > self.threshold:
+                self.logger.warning('Allarme! Switch %s, Porta %s ha superato la soglia con throughput: RX=%f', dpid, port_no, rx_throughput)
+                if (dpid, port_no) not in self.watchlist and (dpid, port_no) not in self.blocklist:
+                    self.watchlist[(dpid, port_no)] = 0
+                elif (dpid, port_no) in self.watchlist:
+                    self.watchlist[(dpid, port_no)] += 1
+
+                self.logger.info(f'\nAGGIUNGO Watchlist: {self.watchlist}\n')
+            elif rx_throughput < self.threshold:
+                if (dpid, port_no) in self.watchlist:
+                    if self.watchlist[(dpid, port_no)] > 0:
+                        self.watchlist[(dpid, port_no)] -= 1
+
+        # Calculate the final threshold based on the number of active ports
+        final_threshold = (self.threshold + self.threshold * 0.1) / self.num_active_ports if self.num_active_ports > 1 else 10000000
+
+        if (dpid, port_no) in self.watchlist:
+            if rx_throughput > final_threshold and self.watchlist[(dpid, port_no)] > 1:
+                if (dpid, port_no) not in self.blocklist:
+                    self.blocklist[(dpid, port_no)] = 0
+
+                self._block_port(dpid, port_no)
